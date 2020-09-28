@@ -1,0 +1,379 @@
+"""CBERS cloud demo endpoint."""
+
+# Extra packages:
+# tensorflow, keras
+
+import os
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Type, Union
+from urllib.parse import urlencode
+
+import numpy as np
+import pkg_resources
+from keras.models import load_model
+from morecantile import TileMatrixSet
+from rasterio.transform import from_bounds
+from rio_tiler_crs import STACReader
+
+from .. import utils
+from ..dependencies import DefaultDependency
+from ..models.dataset import Info, Metadata
+from ..models.mapbox import TileJSON
+from ..ressources.common import img_endpoint_params
+from ..ressources.enums import (  # fmt: off
+    ImageMimeTypes,
+    ImageType,
+)
+from .factory import TMSTilerFactory
+
+from fastapi import Depends, Path, Query
+
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, Response
+from starlette.templating import Jinja2Templates
+
+NETWORK_FILE = "./keras-models/cloud_segmentation_20200923_1844.h5"
+MODEL = load_model(NETWORK_FILE)
+# Parameters to obtain MUX from LS values
+# MUX = LS * gain + offset
+# Marco's e-mail, 23/9/2020
+# Order is R, G, B, NIR (MUX B7, B6, B5, B8)
+M2L_GAINS = [0.0058, 0.0067, 0.0077, 0.0038]
+M2L_OFFSETS = [-27.7421, -31.9362, -38.3616, -13.3762]
+
+template_dir = pkg_resources.resource_filename("titiler", "templates")
+templates = Jinja2Templates(directory=template_dir)
+
+@dataclass
+class AssetsBidxParams(DefaultDependency):
+    """Asset and Band indexes parameters."""
+
+    assets: Optional[str] = Query(
+        None,
+        title="Asset indexes",
+        description="comma (',') delimited asset names (might not be an available options of some readers)",
+    )
+    bidx: Optional[str] = Query(
+        None, title="Band indexes", description="comma (',') delimited band indexes",
+    )
+
+    def __post_init__(self):
+        """Post Init."""
+        if self.assets is not None:
+            self.kwargs["assets"] = self.assets.split(",")
+        if self.bidx is not None:
+            self.kwargs["indexes"] = tuple(
+                int(s) for s in re.findall(r"\d+", self.bidx)
+            )
+
+
+@dataclass
+class AssetsBidxExprParams(DefaultDependency):
+    """Assets, Band Indexes and Expression parameters."""
+
+    assets: Optional[str] = Query(
+        None,
+        title="Asset indexes",
+        description="comma (',') delimited asset names (might not be an available options of some readers)",
+    )
+    expression: Optional[str] = Query(
+        None,
+        title="Band Math expression",
+        description="rio-tiler's band math expression (e.g B1/B2)",
+    )
+    bidx: Optional[str] = Query(
+        None, title="Band indexes", description="comma (',') delimited band indexes",
+    )
+
+    def __post_init__(self):
+        """Post Init."""
+        if self.assets is not None:
+            self.kwargs["assets"] = self.assets.split(",")
+        if self.expression is not None:
+            self.kwargs["expression"] = self.expression
+        if self.bidx is not None:
+            self.kwargs["indexes"] = tuple(
+                int(s) for s in re.findall(r"\d+", self.bidx)
+            )
+
+
+@dataclass
+class CBERSCloudTiler(TMSTilerFactory):
+    """Custom Tiler for CBERS clouds from STAC."""
+
+    reader: Type[STACReader] = STACReader
+    # dataset_reader: BaseReader = field(default=COGReader)
+
+    layer_dependency: Type[DefaultDependency] = AssetsBidxExprParams
+
+    # Overwrite _info method to return the list of assets when no assets is passed.
+    def info(self):
+        """Register /info endpoint."""
+
+        @self.router.get(
+            "/info",
+            response_model=Union[List[str], Dict[str, Info]],
+            response_model_exclude={"minzoom", "maxzoom", "center"},
+            response_model_exclude_none=True,
+            responses={200: {"description": "Return dataset's basic info."}},
+        )
+        def info(
+            src_path=Depends(self.path_dependency),
+            asset_params=Depends(AssetsBidxParams),
+            kwargs: Dict = Depends(self.additional_dependency),
+        ):
+            """Return basic info."""
+            with self.reader(src_path.url, **self.reader_options) as src_dst:
+                if not asset_params.assets:
+                    return src_dst.assets
+                info = src_dst.info(**asset_params.kwargs, **kwargs)
+            return info
+
+    # Overwrite _metadata method because the STACTiler output model is different
+    # cogMetadata -> Dict[str, cogMetadata]
+    def metadata(self):
+        """Register /metadata endpoint."""
+
+        @self.router.get(
+            "/metadata",
+            response_model=Dict[str, Metadata],
+            response_model_exclude={"minzoom", "maxzoom", "center"},
+            response_model_exclude_none=True,
+            responses={200: {"description": "Return dataset's metadata."}},
+        )
+        def metadata(
+            src_path=Depends(self.path_dependency),
+            asset_params=Depends(AssetsBidxParams),
+            metadata_params=Depends(self.metadata_dependency),
+            kwargs: Dict = Depends(self.additional_dependency),
+        ):
+            """Return metadata."""
+            with self.reader(src_path.url, **self.reader_options) as src_dst:
+                info = src_dst.metadata(
+                    metadata_params.pmin,
+                    metadata_params.pmax,
+                    **asset_params.kwargs,
+                    **metadata_params.kwargs,
+                    **kwargs,
+                )
+            return info
+
+    # Overwrite _tile method to compute cloud cover on the fly
+    def tile(self):  # noqa: C901
+        """Register /tiles endpoints."""
+        tile_endpoint_params = img_endpoint_params.copy()
+
+        @self.router.get(r"/tiles/{z}/{x}/{y}", **tile_endpoint_params)
+        @self.router.get(r"/tiles/{z}/{x}/{y}.{format}", **tile_endpoint_params)
+        @self.router.get(r"/tiles/{z}/{x}/{y}@{scale}x", **tile_endpoint_params)
+        @self.router.get(
+            r"/tiles/{z}/{x}/{y}@{scale}x.{format}", **tile_endpoint_params
+        )
+        @self.router.get(
+            r"/tiles/{TileMatrixSetId}/{z}/{x}/{y}", **tile_endpoint_params
+        )
+        @self.router.get(
+            r"/tiles/{TileMatrixSetId}/{z}/{x}/{y}.{format}", **tile_endpoint_params
+        )
+        @self.router.get(
+            r"/tiles/{TileMatrixSetId}/{z}/{x}/{y}@{scale}x", **tile_endpoint_params
+        )
+        @self.router.get(
+            r"/tiles/{TileMatrixSetId}/{z}/{x}/{y}@{scale}x.{format}",
+            **tile_endpoint_params,
+        )
+        def tile(
+            z: int = Path(..., ge=0, le=30, description="Mercator tiles's zoom level"),
+            x: int = Path(..., description="Mercator tiles's column"),
+            y: int = Path(..., description="Mercator tiles's row"),
+            tms: TileMatrixSet = Depends(self.tms_dependency),
+            scale: int = Query(
+                1, gt=0, lt=4, description="Tile size scale. 1=256x256, 2=512x512..."
+            ),
+            format: ImageType = Query(
+                None, description="Output image type. Default is auto."
+            ),
+            src_path=Depends(self.path_dependency),
+            layer_params=Depends(self.layer_dependency),
+            dataset_params=Depends(self.dataset_dependency),
+            render_params=Depends(self.render_dependency),
+            kwargs: Dict = Depends(self.additional_dependency),
+        ):
+            """Create map tile from a dataset."""
+            timings = []
+            headers: Dict[str, str] = {}
+
+            tilesize = scale * 256
+
+            # import pdb; pdb.set_trace()
+            # src_path is the stac item json URL
+            # layer_params is:
+            # AssetsBidxExprParams(kwargs={'assets': ['B7', 'B6', 'B5']}, assets='B7,B6,B5', expression=None, bidx=None)
+            # dataset_params is:
+            # DatasetParams(kwargs={'resampling_method': 'nearest'}, nodata=None, unscale=None, resampling_method=<ResamplingNames.nearest: 'nearest'>)
+            # kwargs is {}
+            # STAC item with EO extension
+            with utils.Timer() as t:
+                with self.reader(
+                    src_path.url, tms=tms, **self.reader_options
+                ) as src_dst:
+                    tile, mask = src_dst.tile(
+                        x,
+                        y,
+                        z,
+                        tilesize=tilesize,
+                        **layer_params.kwargs,
+                        **dataset_params.kwargs,
+                        **kwargs,
+                    )
+                    colormap = render_params.colormap or getattr(
+                        src_dst, "colormap", None
+                    )
+
+            timings.append(("Read", t.elapsed))
+
+            if not format:
+                format = ImageType.jpg if mask.all() else ImageType.png
+
+            with utils.Timer() as t:
+                tile = utils.postprocess(
+                    tile,
+                    mask,
+                    rescale=render_params.rescale,
+                    color_formula=render_params.color_formula,
+                )
+            timings.append(("Post-process", t.elapsed))
+
+            # import pdb; pdb.set_trace()
+            # Change axis organization to NN convention,
+            # bands is last.
+            rtile = np.moveaxis(tile, 0, -1)
+            # Add first dimension (single batch)
+            rtile = np.expand_dims(rtile, axis=0)
+            # Create input for network and apply MUX scaling
+            stile = np.empty((1, 256, 256, 4))
+            for i in range(0, 4):
+                stile[0, :, :, i] = (rtile[0, :, :, i] - M2L_OFFSETS[i]) / M2L_GAINS[i]
+            # Prediction
+            pred = MODEL.predict(stile)
+            # Cloud mask from prediction
+            cloud_mask = np.argmax(pred, axis=-1)
+            cloud_mask[cloud_mask == 1] = 255
+
+            # import pdb; pdb.set_trace()
+            bounds = tms.xy_bounds(x, y, z)
+            dst_transform = from_bounds(*bounds, tilesize, tilesize)
+            with utils.Timer() as t:
+                content = utils.reformat(
+                    # tile[0:3],
+                    cloud_mask.astype("uint8"),
+                    mask if render_params.return_mask else None,
+                    format,
+                    colormap=colormap,
+                    transform=dst_transform,
+                    crs=tms.crs,
+                )
+            timings.append(("Format", t.elapsed))
+
+            if timings:
+                headers["X-Server-Timings"] = "; ".join(
+                    [
+                        "{} - {:0.2f}".format(name, time * 1000)
+                        for (name, time) in timings
+                    ]
+                )
+
+            return Response(
+                content, media_type=ImageMimeTypes[format.value].value, headers=headers,
+            )
+
+        @self.router.get(
+            "/tilejson.json",
+            response_model=TileJSON,
+            responses={200: {"description": "Return a tilejson"}},
+            response_model_exclude_none=True,
+        )
+        @self.router.get(
+            "/{TileMatrixSetId}/tilejson.json",
+            response_model=TileJSON,
+            responses={200: {"description": "Return a tilejson"}},
+            response_model_exclude_none=True,
+        )
+        def tilejson(
+            request: Request,
+            tms: TileMatrixSet = Depends(self.tms_dependency),
+            src_path=Depends(self.path_dependency),
+            tile_format: Optional[ImageType] = Query(
+                None, description="Output image type. Default is auto."
+            ),
+            tile_scale: int = Query(
+                1, gt=0, lt=4, description="Tile size scale. 1=256x256, 2=512x512..."
+            ),
+            minzoom: Optional[int] = Query(
+                None, description="Overwrite default minzoom."
+            ),
+            maxzoom: Optional[int] = Query(
+                None, description="Overwrite default maxzoom."
+            ),
+            layer_params=Depends(self.layer_dependency),  # noqa
+            dataset_params=Depends(self.dataset_dependency),  # noqa
+            render_params=Depends(self.render_dependency),  # noqa
+            kwargs: Dict = Depends(self.additional_dependency),  # noqa
+        ):
+            """Return TileJSON document for a dataset."""
+            route_params = {
+                "z": "{z}",
+                "x": "{x}",
+                "y": "{y}",
+                "scale": tile_scale,
+                "TileMatrixSetId": tms.identifier,
+            }
+            if tile_format:
+                route_params["format"] = tile_format.value
+            tiles_url = self.url_for(request, "tile", **route_params)
+
+            q = dict(request.query_params)
+            q.pop("TileMatrixSetId", None)
+            q.pop("tile_format", None)
+            q.pop("tile_scale", None)
+            q.pop("minzoom", None)
+            q.pop("maxzoom", None)
+            qs = urlencode(list(q.items()))
+            tiles_url += f"?{qs}"
+            # import pdb; pdb.set_trace()
+
+            with self.reader(src_path.url, tms=tms, **self.reader_options) as src_dst:
+                center = list(src_dst.center)
+                if minzoom:
+                    center[-1] = minzoom
+                tjson = {
+                    "bounds": src_dst.bounds,
+                    "center": tuple(center),
+                    "minzoom": minzoom if minzoom is not None else src_dst.minzoom,
+                    "maxzoom": maxzoom if maxzoom is not None else src_dst.maxzoom,
+                    "name": os.path.basename(src_path.url),
+                    "tiles": [tiles_url],
+                }
+
+            return tjson
+
+
+cbers_cloud = CBERSCloudTiler(router_prefix="cberscloud")
+
+
+@cbers_cloud.router.get("/viewer", response_class=HTMLResponse)
+def stac_cloud_demo(request: Request):
+    """STAC Viewer."""
+    return templates.TemplateResponse(
+        name="stac_index.html",
+        context={
+            "request": request,
+            "tilejson": cbers_cloud.url_for(request, "tilejson"),
+            "metadata": cbers_cloud.url_for(request, "info"),
+        },
+        media_type="text/html",
+    )
+
+
+router = cbers_cloud.router
