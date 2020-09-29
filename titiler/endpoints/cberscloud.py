@@ -4,9 +4,8 @@
 # tensorflow, keras
 
 import os
-import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Type, Union
+from typing import Dict, Optional, Type
 from urllib.parse import urlencode
 
 import numpy as np
@@ -16,29 +15,45 @@ from morecantile import TileMatrixSet
 from rasterio.transform import from_bounds
 from rio_tiler_crs import STACReader
 
+from fastapi import Depends, Path, Query
+
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.templating import Jinja2Templates
+
 from .. import utils
 from ..dependencies import DefaultDependency
 from ..models.dataset import Info, Metadata
 from ..models.mapbox import TileJSON
 from ..ressources.common import img_endpoint_params
-from ..ressources.enums import (  # fmt: off
-    ImageMimeTypes,
-    ImageType,
-)
+from ..ressources.enums import ImageMimeTypes, ImageType  # fmt: off
 from .factory import TMSTilerFactory
-
-from fastapi import Depends, Path, Query
-
-from starlette.requests import Request
-from starlette.responses import HTMLResponse, Response
-from starlette.templating import Jinja2Templates
 
 NETWORK_FILE = "./keras-models/cloud_segmentation_20200923_1844.h5"
 MODEL = load_model(NETWORK_FILE)
-# Parameters to obtain MUX from LS values
-# MUX = LS * gain + offset
-# Marco's e-mail, 23/9/2020
-# Order is R, G, B, NIR (MUX B7, B6, B5, B8)
+
+# assets: R, G, B, NIR bands
+INSTRUMENT_PARAMS = {
+    "LANDSAT_8": {
+        "kwargs": {
+            "assets": ['B4','B3','B2','B5'],
+        },
+        "m2l_gains": [1.,1.,1.,1.],
+        "m2l_offsets": [0., 0., 0., 0.]
+    },
+    "MUX": {
+        "kwargs": {
+            "assets": ['B7','B6','B5','B8']
+        },
+        # Parameters to obtain MUX from LS values
+        # MUX = LS * gain + offset
+        # Marco's e-mail, 23/9/2020
+        # Order is R, G, B, NIR (MUX B7, B6, B5, B8)
+        "m2l_gains": [0.0058, 0.0067, 0.0077, 0.0038],
+        "m2l_offsets": [-27.7421, -31.9362, -38.3616, -13.3762]
+    }
+}
+
 M2L_GAINS = [0.0058, 0.0067, 0.0077, 0.0038]
 M2L_OFFSETS = [-27.7421, -31.9362, -38.3616, -13.3762]
 
@@ -46,118 +61,27 @@ template_dir = pkg_resources.resource_filename("titiler", "templates")
 templates = Jinja2Templates(directory=template_dir)
 
 @dataclass
-class AssetsBidxParams(DefaultDependency):
-    """Asset and Band indexes parameters."""
-
-    assets: Optional[str] = Query(
-        None,
-        title="Asset indexes",
-        description="comma (',') delimited asset names (might not be an available options of some readers)",
-    )
-    bidx: Optional[str] = Query(
-        None, title="Band indexes", description="comma (',') delimited band indexes",
-    )
-
-    def __post_init__(self):
-        """Post Init."""
-        if self.assets is not None:
-            self.kwargs["assets"] = self.assets.split(",")
-        if self.bidx is not None:
-            self.kwargs["indexes"] = tuple(
-                int(s) for s in re.findall(r"\d+", self.bidx)
-            )
-
-
-@dataclass
-class AssetsBidxExprParams(DefaultDependency):
+class AssetsParams(DefaultDependency):
     """Assets, Band Indexes and Expression parameters."""
 
     assets: Optional[str] = Query(
         None,
         title="Asset indexes",
-        description="comma (',') delimited asset names (might not be an available options of some readers)",
-    )
-    expression: Optional[str] = Query(
-        None,
-        title="Band Math expression",
-        description="rio-tiler's band math expression (e.g B1/B2)",
-    )
-    bidx: Optional[str] = Query(
-        None, title="Band indexes", description="comma (',') delimited band indexes",
+        description="comma (',') delimited asset names for R, G, B and NIR bands",
     )
 
     def __post_init__(self):
         """Post Init."""
         if self.assets is not None:
             self.kwargs["assets"] = self.assets.split(",")
-        if self.expression is not None:
-            self.kwargs["expression"] = self.expression
-        if self.bidx is not None:
-            self.kwargs["indexes"] = tuple(
-                int(s) for s in re.findall(r"\d+", self.bidx)
-            )
-
 
 @dataclass
 class CBERSCloudTiler(TMSTilerFactory):
     """Custom Tiler for CBERS clouds from STAC."""
 
     reader: Type[STACReader] = STACReader
-    # dataset_reader: BaseReader = field(default=COGReader)
 
-    layer_dependency: Type[DefaultDependency] = AssetsBidxExprParams
-
-    # Overwrite _info method to return the list of assets when no assets is passed.
-    def info(self):
-        """Register /info endpoint."""
-
-        @self.router.get(
-            "/info",
-            response_model=Union[List[str], Dict[str, Info]],
-            response_model_exclude={"minzoom", "maxzoom", "center"},
-            response_model_exclude_none=True,
-            responses={200: {"description": "Return dataset's basic info."}},
-        )
-        def info(
-            src_path=Depends(self.path_dependency),
-            asset_params=Depends(AssetsBidxParams),
-            kwargs: Dict = Depends(self.additional_dependency),
-        ):
-            """Return basic info."""
-            with self.reader(src_path.url, **self.reader_options) as src_dst:
-                if not asset_params.assets:
-                    return src_dst.assets
-                info = src_dst.info(**asset_params.kwargs, **kwargs)
-            return info
-
-    # Overwrite _metadata method because the STACTiler output model is different
-    # cogMetadata -> Dict[str, cogMetadata]
-    def metadata(self):
-        """Register /metadata endpoint."""
-
-        @self.router.get(
-            "/metadata",
-            response_model=Dict[str, Metadata],
-            response_model_exclude={"minzoom", "maxzoom", "center"},
-            response_model_exclude_none=True,
-            responses={200: {"description": "Return dataset's metadata."}},
-        )
-        def metadata(
-            src_path=Depends(self.path_dependency),
-            asset_params=Depends(AssetsBidxParams),
-            metadata_params=Depends(self.metadata_dependency),
-            kwargs: Dict = Depends(self.additional_dependency),
-        ):
-            """Return metadata."""
-            with self.reader(src_path.url, **self.reader_options) as src_dst:
-                info = src_dst.metadata(
-                    metadata_params.pmin,
-                    metadata_params.pmax,
-                    **asset_params.kwargs,
-                    **metadata_params.kwargs,
-                    **kwargs,
-                )
-            return info
+    layer_dependency: Type[DefaultDependency] = AssetsParams
 
     # Overwrite _tile method to compute cloud cover on the fly
     def tile(self):  # noqa: C901
@@ -218,12 +142,20 @@ class CBERSCloudTiler(TMSTilerFactory):
                 with self.reader(
                     src_path.url, tms=tms, **self.reader_options
                 ) as src_dst:
+                    #import pdb; pdb.set_trace()
+                    platform = src_dst.item['properties']['platform']
+                    # If platform is CBERS-4 then the instrument is used as key
+                    if platform == 'CBERS-4':
+                        platform = src_dst.item['properties']['instruments'][0]
+                    instrument_p = INSTRUMENT_PARAMS.get(platform)
+                    assert instrument_p, f"Platform {instrument_p} not supported"
                     tile, mask = src_dst.tile(
                         x,
                         y,
                         z,
                         tilesize=tilesize,
-                        **layer_params.kwargs,
+                        #**layer_params.kwargs,
+                        **instrument_p['kwargs'],
                         **dataset_params.kwargs,
                         **kwargs,
                     )
@@ -254,7 +186,9 @@ class CBERSCloudTiler(TMSTilerFactory):
             # Create input for network and apply MUX scaling
             stile = np.empty((1, 256, 256, 4))
             for i in range(0, 4):
-                stile[0, :, :, i] = (rtile[0, :, :, i] - M2L_OFFSETS[i]) / M2L_GAINS[i]
+                stile[0, :, :, i] = (rtile[0, :, :, i] - \
+                                     INSTRUMENT_PARAMS[platform]['m2l_offsets'][i]) / \
+                                     INSTRUMENT_PARAMS[platform]['m2l_gains'][i]
             # Prediction
             pred = MODEL.predict(stile)
             # Cloud mask from prediction
@@ -360,20 +294,5 @@ class CBERSCloudTiler(TMSTilerFactory):
 
 
 cbers_cloud = CBERSCloudTiler(router_prefix="cberscloud")
-
-
-@cbers_cloud.router.get("/viewer", response_class=HTMLResponse)
-def stac_cloud_demo(request: Request):
-    """STAC Viewer."""
-    return templates.TemplateResponse(
-        name="stac_index.html",
-        context={
-            "request": request,
-            "tilejson": cbers_cloud.url_for(request, "tilejson"),
-            "metadata": cbers_cloud.url_for(request, "info"),
-        },
-        media_type="text/html",
-    )
-
 
 router = cbers_cloud.router
