@@ -15,12 +15,6 @@ from morecantile import TileMatrixSet
 from rasterio.transform import from_bounds
 from rio_tiler_crs import STACReader
 
-from fastapi import Depends, Path, Query
-
-from starlette.requests import Request
-from starlette.responses import Response
-from starlette.templating import Jinja2Templates
-
 from .. import utils
 from ..dependencies import DefaultDependency
 from ..models.dataset import Info, Metadata
@@ -29,36 +23,45 @@ from ..ressources.common import img_endpoint_params
 from ..ressources.enums import ImageMimeTypes, ImageType  # fmt: off
 from .factory import TMSTilerFactory
 
+from fastapi import Depends, Path, Query
+
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.templating import Jinja2Templates
+
 NETWORK_FILE = "./keras-models/cloud_segmentation_20200923_1844.h5"
 MODEL = load_model(NETWORK_FILE)
 
 # assets: R, G, B, NIR bands
 INSTRUMENT_PARAMS = {
     "LANDSAT_8": {
-        "kwargs": {
-            "assets": ['B4','B3','B2','B5'],
-        },
-        "m2l_gains": [1.,1.,1.,1.],
-        "m2l_offsets": [0., 0., 0., 0.]
+        "kwargs": {"assets": ["B4", "B3", "B2", "B5"],},
+        "m2l_gains": [1.0, 1.0, 1.0, 1.0],
+        "m2l_offsets": [0.0, 0.0, 0.0, 0.0],
     },
     "MUX": {
-        "kwargs": {
-            "assets": ['B7','B6','B5','B8']
-        },
+        "kwargs": {"assets": ["B7", "B6", "B5", "B8"]},
         # Parameters to obtain MUX from LS values
         # MUX = LS * gain + offset
         # Marco's e-mail, 23/9/2020
         # Order is R, G, B, NIR (MUX B7, B6, B5, B8)
         "m2l_gains": [0.0058, 0.0067, 0.0077, 0.0038],
-        "m2l_offsets": [-27.7421, -31.9362, -38.3616, -13.3762]
-    }
+        "m2l_offsets": [-27.7421, -31.9362, -38.3616, -13.3762],
+    },
+    "AWFI": {
+        "kwargs": {"assets": ["B15", "B14", "B13", "B16"]},
+        # Using the MUX parameters for now
+        "m2l_gains": [0.0058, 0.0067, 0.0077, 0.0038],
+        "m2l_offsets": [-27.7421, -31.9362, -38.3616, -13.3762],
+    },
 }
 
-M2L_GAINS = [0.0058, 0.0067, 0.0077, 0.0038]
-M2L_OFFSETS = [-27.7421, -31.9362, -38.3616, -13.3762]
+# M2L_GAINS = [0.0058, 0.0067, 0.0077, 0.0038]
+# M2L_OFFSETS = [-27.7421, -31.9362, -38.3616, -13.3762]
 
 template_dir = pkg_resources.resource_filename("titiler", "templates")
 templates = Jinja2Templates(directory=template_dir)
+
 
 @dataclass
 class AssetsParams(DefaultDependency):
@@ -74,6 +77,7 @@ class AssetsParams(DefaultDependency):
         """Post Init."""
         if self.assets is not None:
             self.kwargs["assets"] = self.assets.split(",")
+
 
 @dataclass
 class CBERSCloudTiler(TMSTilerFactory):
@@ -142,20 +146,20 @@ class CBERSCloudTiler(TMSTilerFactory):
                 with self.reader(
                     src_path.url, tms=tms, **self.reader_options
                 ) as src_dst:
-                    #import pdb; pdb.set_trace()
-                    platform = src_dst.item['properties']['platform']
+                    # import pdb; pdb.set_trace()
+                    platform = src_dst.item["properties"]["platform"]
                     # If platform is CBERS-4 then the instrument is used as key
-                    if platform == 'CBERS-4':
-                        platform = src_dst.item['properties']['instruments'][0]
+                    if platform == "CBERS-4":
+                        platform = src_dst.item["properties"]["instruments"][0]
                     instrument_p = INSTRUMENT_PARAMS.get(platform)
-                    assert instrument_p, f"Platform {instrument_p} not supported"
+                    assert instrument_p, f"Instrument {platform} not supported"
                     tile, mask = src_dst.tile(
                         x,
                         y,
                         z,
                         tilesize=tilesize,
-                        #**layer_params.kwargs,
-                        **instrument_p['kwargs'],
+                        # **layer_params.kwargs,
+                        **instrument_p["kwargs"],
                         **dataset_params.kwargs,
                         **kwargs,
                     )
@@ -186,9 +190,9 @@ class CBERSCloudTiler(TMSTilerFactory):
             # Create input for network and apply MUX scaling
             stile = np.empty((1, 256, 256, 4))
             for i in range(0, 4):
-                stile[0, :, :, i] = (rtile[0, :, :, i] - \
-                                     INSTRUMENT_PARAMS[platform]['m2l_offsets'][i]) / \
-                                     INSTRUMENT_PARAMS[platform]['m2l_gains'][i]
+                stile[0, :, :, i] = (
+                    rtile[0, :, :, i] - INSTRUMENT_PARAMS[platform]["m2l_offsets"][i]
+                ) / INSTRUMENT_PARAMS[platform]["m2l_gains"][i]
             # Prediction
             pred = MODEL.predict(stile)
             # Cloud mask from prediction
