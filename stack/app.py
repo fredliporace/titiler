@@ -109,12 +109,14 @@ class titilerLambdaStack(core.Stack):
         print("Creating lambda package [running in Docker]...")
         client = docker.from_env()
 
-        print("Building docker image...")
-        client.images.build(
-            path=code_dir,
-            dockerfile="Dockerfiles/lambda/Dockerfile",
-            tag="lambda:latest",
-        )
+        # Docker image manually generated
+        # docker build --file=./Dockerfiles/lambda/Dockerfile . -t lambda:latest
+        # print("Building docker image...")
+        # client.images.build(
+        #     path=code_dir,
+        #     dockerfile="Dockerfiles/lambda/Dockerfile",
+        #     tag="lambda:latest",
+        # )
 
         print("Copying package.zip ...")
         client.containers.run(
