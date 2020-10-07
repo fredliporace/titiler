@@ -10,3 +10,6 @@ RUN cd tensorflow && sh tensorflow/lite/tools/pip_package/build_pip_package.sh
 
 # at this point I had to comment out a line from a file to avoid an error
 # the code was an assert
+# extra steps:
+# mkdir /app/wheels
+# cp tensorflow/lite/tools/pip_package/gen/tflite_pip/python3/dist/tflite_runtime-2.4.0-cp37-cp37m-linux_x86_64.whl /app/wheels/

@@ -24,5 +24,5 @@ RUN cd /var/task && zip -r9q /tmp/package.zip *
 COPY lambda/handler.py handler.py
 RUN zip -r9q /tmp/package.zip handler.py
 
-COPY keras-models/cloud_segmentation_20200923_1844.tflite cloud_segmentation_20200923_1844.tflite
-RUN zip -r9q /tmp/package.zip cloud_segmentation_20200923_1844.tflite
+COPY keras-models/cloud_segmentation_20201006_1917.tflite cloud_segmentation.tflite
+RUN zip -r9q /tmp/package.zip cloud_segmentation.tflite

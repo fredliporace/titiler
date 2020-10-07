@@ -10,7 +10,8 @@ from urllib.parse import urlencode
 
 import numpy as np
 import pkg_resources
-#from keras.models import load_model
+
+# from keras.models import load_model
 import tflite_runtime.interpreter as tflite
 from morecantile import TileMatrixSet
 from rasterio.transform import from_bounds
@@ -29,11 +30,6 @@ from fastapi import Depends, Path, Query
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.templating import Jinja2Templates
-
-# Keras inference
-# NETWORK_FILE = "./keras-models/cloud_segmentation_20200923_1844.h5"
-# MODEL = load_model(NETWORK_FILE)
-# tflite inference
 
 # assets: R, G, B, NIR bands
 INSTRUMENT_PARAMS = {
@@ -204,12 +200,13 @@ class CBERSCloudTiler(TMSTilerFactory):
             # INPUT_TENSOR_INDEX = INTERPRETER.get_input_details()[0]['index']
             # OUTPUT_TENSOR_INDEX = INTERPRETER.get_output_details()[0]['index']
             # self.interpreter.allocate_tensors()
-            interpreter = tflite.Interpreter(model_path='./cloud_segmentation_20200923_1844.tflite')
+            interpreter = tflite.Interpreter(model_path="./cloud_segmentation.tflite")
             interpreter.allocate_tensors()
-            input_tensor_index = interpreter.get_input_details()[0]['index']
-            output_tensor_index = interpreter.get_output_details()[0]['index']
-            interpreter.set_tensor(input_tensor_index,
-                                   np.array(stile, dtype=np.float32))
+            input_tensor_index = interpreter.get_input_details()[0]["index"]
+            output_tensor_index = interpreter.get_output_details()[0]["index"]
+            interpreter.set_tensor(
+                input_tensor_index, np.array(stile, dtype=np.float32)
+            )
             interpreter.invoke()
             pred = interpreter.get_tensor(output_tensor_index)
             # Cloud mask from prediction
