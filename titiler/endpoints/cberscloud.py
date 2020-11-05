@@ -10,8 +10,6 @@ from urllib.parse import urlencode
 
 import numpy as np
 import pkg_resources
-
-# from keras.models import load_model
 import tflite_runtime.interpreter as tflite
 from morecantile import TileMatrixSet
 from rasterio.transform import from_bounds
@@ -49,14 +47,17 @@ INSTRUMENT_PARAMS = {
     },
     "AWFI": {
         "kwargs": {"assets": ["B15", "B14", "B13", "B16"]},
-        # Using the MUX parameters for now
-        "m2l_gains": [0.0058, 0.0067, 0.0077, 0.0038],
-        "m2l_offsets": [-27.7421, -31.9362, -38.3616, -13.3762],
+        # Naive approach, simple scaling from 10 to 16 bits
+        "m2l_gains": [0.015625, 0.015625, 0.015625, 0.015625],
+        "m2l_offsets": [0.0, 0.0, 0.0, 0.0],
+    },
+    "WFI": {
+        "kwargs": {"assets": ["B15", "B14", "B13", "B16"]},
+        # Naive approach, simple scaling from 10 to 16 bits
+        "m2l_gains": [0.015625, 0.015625, 0.015625, 0.015625],
+        "m2l_offsets": [0.0, 0.0, 0.0, 0.0],
     },
 }
-
-# M2L_GAINS = [0.0058, 0.0067, 0.0077, 0.0038]
-# M2L_OFFSETS = [-27.7421, -31.9362, -38.3616, -13.3762]
 
 template_dir = pkg_resources.resource_filename("titiler", "templates")
 templates = Jinja2Templates(directory=template_dir)
@@ -147,8 +148,8 @@ class CBERSCloudTiler(TMSTilerFactory):
                 ) as src_dst:
                     # import pdb; pdb.set_trace()
                     platform = src_dst.item["properties"]["platform"]
-                    # If platform is CBERS-4 then the instrument is used as key
-                    if platform == "CBERS-4":
+                    # If platform is CBERS-4/4A then the instrument is used as key
+                    if "CBERS-4" in platform:
                         platform = src_dst.item["properties"]["instruments"][0]
                     instrument_p = INSTRUMENT_PARAMS.get(platform)
                     assert instrument_p, f"Instrument {platform} not supported"

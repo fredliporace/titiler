@@ -5,3 +5,7 @@ $ docker build --file=./Dockerfiles/lambda/Dockerfile . -t lambda:latest
 Lambda deploy
 
 $ cdk deploy my-tiler-lambda-dev
+
+Executar servidor localmente
+
+$ uvicorn titiler.main:app --reload
